@@ -21,6 +21,11 @@ def _frame_fingerprint(df: pd.DataFrame) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _resolve_column(columns, expected: str) -> str | None:
+    lookup = {str(c).strip().lower(): c for c in columns}
+    return lookup.get(expected.lower())
+
+
 def load_dataset(random_state: int = RANDOM_STATE):
     RAW.mkdir(parents=True, exist_ok=True)
     if CACHE.exists():
@@ -32,19 +37,32 @@ def load_dataset(random_state: int = RANDOM_STATE):
 
     if len(df) != EXPECTED_ROWS:
         raise ValueError(f"Expected {EXPECTED_ROWS} rows, found {len(df)}")
-    if TARGET not in df.columns or ID_COL not in df.columns:
-        raise ValueError("Expected Churn target and customerID identifier")
-    if df[ID_COL].duplicated().any():
-        raise ValueError("customerID must be unique")
 
-    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
-    missing_total_charges = int(df["TotalCharges"].isna().sum())
-    df["TotalCharges"] = df["TotalCharges"].fillna(0.0)
+    target_col = _resolve_column(df.columns, TARGET)
+    id_col = _resolve_column(df.columns, ID_COL)
+    total_charges_col = _resolve_column(df.columns, "TotalCharges")
 
-    y = df[TARGET].astype(str).str.strip().map({"No": 0, "Yes": 1})
+    if target_col is None:
+        raise ValueError(f"Expected target column {TARGET!r}; found columns: {list(df.columns)}")
+    if total_charges_col is None:
+        raise ValueError("Expected TotalCharges feature")
+
+    # Some OpenML distributions omit the customer identifier because it is not a
+    # predictive feature. Treat it as optional rather than failing the pipeline.
+    identifier_available = id_col is not None
+    if identifier_available and df[id_col].duplicated().any():
+        raise ValueError("customerID must be unique when present")
+
+    df[total_charges_col] = pd.to_numeric(df[total_charges_col], errors="coerce")
+    missing_total_charges = int(df[total_charges_col].isna().sum())
+    df[total_charges_col] = df[total_charges_col].fillna(0.0)
+
+    y = df[target_col].astype(str).str.strip().map({"No": 0, "Yes": 1})
     if y.isna().any():
         raise ValueError("Unexpected churn labels")
-    X = df.drop(columns=[TARGET, ID_COL]).copy()
+
+    drop_cols = [target_col] + ([id_col] if identifier_available else [])
+    X = df.drop(columns=drop_cols).copy()
 
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.40, random_state=random_state, stratify=y
@@ -59,6 +77,7 @@ def load_dataset(random_state: int = RANDOM_STATE):
         "features": int(X.shape[1]),
         "churn_rows": int(y.sum()),
         "churn_rate": float(y.mean()),
+        "identifier_available": bool(identifier_available),
         "missing_total_charges_coerced": missing_total_charges,
         "train_rows": int(len(X_train)),
         "validation_rows": int(len(X_val)),
